@@ -201,32 +201,60 @@ declare function capitalize(str: string): string;
             const dummyModel = monaco.editor.createModel('', 'javascript');
             dummyModel.dispose();
 
-            // --- Helper to check if inside interpolation using tokenization ---
-            function isInsideInterpolation(model, offset) {
-                const source = model.getValue();
-                const tokenLines = monaco.editor.tokenize(source, LANGUAGE_ID);
+            // --- Virtual model for JavaScript completions ---
+            const VIRTUAL_JS_URI = monaco.Uri.parse('file:///interpolation-expr.js');
+            let virtualJsModel = null;
 
-                let currentOffset = 0;
-                for (let lineIdx = 0; lineIdx < tokenLines.length; lineIdx++) {
-                    const lineTokens = tokenLines[lineIdx];
-                    const lineContent = model.getLineContent(lineIdx + 1);
+            function getOrCreateVirtualJsModel() {
+                if (!virtualJsModel || virtualJsModel.isDisposed()) {
+                    virtualJsModel = monaco.editor.createModel('', 'javascript', VIRTUAL_JS_URI);
+                }
+                return virtualJsModel;
+            }
 
-                    for (let tokenIdx = 0; tokenIdx < lineTokens.length; tokenIdx++) {
-                        const token = lineTokens[tokenIdx];
-                        const nextToken = lineTokens[tokenIdx + 1];
-                        const tokenStart = currentOffset + token.offset;
-                        const tokenEnd = nextToken
-                            ? currentOffset + nextToken.offset
-                            : currentOffset + lineContent.length;
+            // --- Helper to extract interpolation context at a position ---
+            function getInterpolationContext(model, position) {
+                const text = model.getValue();
+                const offset = model.getOffsetAt(position);
 
-                        if (offset >= tokenStart && offset <= tokenEnd) {
-                            // Check if in embedded JS (token type doesn't end with our language)
-                            return !token.type.endsWith('.json-interpolation') && token.type !== '';
+                // Find the ${ that contains the current position
+                const beforeCursor = text.substring(0, offset);
+                const lastStart = beforeCursor.lastIndexOf('${');
+
+                if (lastStart === -1) {
+                    return null;
+                }
+
+                // Check if there's a closing } between ${ and cursor
+                const betweenStartAndCursor = text.substring(lastStart + 2, offset);
+                if (betweenStartAndCursor.includes('}')) {
+                    return null;
+                }
+
+                // Find the closing } (handle nested braces)
+                let depth = 1;
+                let endOffset = offset;
+                for (let i = offset; i < text.length; i++) {
+                    if (text[i] === '{') depth++;
+                    else if (text[i] === '}') {
+                        depth--;
+                        if (depth === 0) {
+                            endOffset = i;
+                            break;
                         }
                     }
-                    currentOffset += lineContent.length + 1;
                 }
-                return false;
+
+                // Extract the expression (content between ${ and })
+                const expressionStart = lastStart + 2;
+                const expression = text.substring(expressionStart, endOffset);
+                const offsetInExpression = offset - expressionStart;
+
+                return {
+                    expression,
+                    expressionStart,
+                    offsetInExpression
+                };
             }
 
             // --- Completion provider for JS inside interpolation ---
@@ -234,37 +262,43 @@ declare function capitalize(str: string): string;
                 triggerCharacters: ['"', ':', ' ', '$', '{', '.'],
 
                 async provideCompletionItems(model, position) {
-                    const offset = model.getOffsetAt(position);
+                    const ctx = getInterpolationContext(model, position);
+                    if (!ctx) return null;
 
-                    if (isInsideInterpolation(model, offset)) {
-                        try {
-                            const getWorker = await monaco.languages.typescript.getJavaScriptWorker();
-                            const worker = await getWorker(model.uri);
-                            const info = await worker.getCompletionsAtPosition(model.uri.toString(), offset);
+                    try {
+                        // Create/update virtual JS model with just the expression
+                        const jsModel = getOrCreateVirtualJsModel();
+                        jsModel.setValue(ctx.expression);
 
-                            if (!info || !info.entries) return null;
+                        const getWorker = await monaco.languages.typescript.getJavaScriptWorker();
+                        const worker = await getWorker(VIRTUAL_JS_URI);
+                        const info = await worker.getCompletionsAtPosition(
+                            VIRTUAL_JS_URI.toString(),
+                            ctx.offsetInExpression
+                        );
 
-                            const wordInfo = model.getWordUntilPosition(position);
-                            const range = {
-                                startLineNumber: position.lineNumber,
-                                startColumn: wordInfo.startColumn,
-                                endLineNumber: position.lineNumber,
-                                endColumn: wordInfo.endColumn
-                            };
+                        if (!info || !info.entries) return null;
 
-                            const suggestions = info.entries.map(entry => ({
-                                label: entry.name,
-                                kind: monaco.languages.CompletionItemKind.Variable,
-                                detail: entry.kindModifiers,
-                                sortText: entry.sortText,
-                                insertText: entry.insertText || entry.name,
-                                range: range
-                            }));
+                        const wordInfo = model.getWordUntilPosition(position);
+                        const range = {
+                            startLineNumber: position.lineNumber,
+                            startColumn: wordInfo.startColumn,
+                            endLineNumber: position.lineNumber,
+                            endColumn: wordInfo.endColumn
+                        };
 
-                            return { suggestions };
-                        } catch (e) {
-                            console.error('JS completion error:', e);
-                        }
+                        const suggestions = info.entries.map(entry => ({
+                            label: entry.name,
+                            kind: monaco.languages.CompletionItemKind.Variable,
+                            detail: entry.kindModifiers,
+                            sortText: entry.sortText,
+                            insertText: entry.insertText || entry.name,
+                            range: range
+                        }));
+
+                        return { suggestions };
+                    } catch (e) {
+                        console.error('JS completion error:', e);
                     }
                     return null;
                 }
@@ -273,40 +307,46 @@ declare function capitalize(str: string): string;
             // --- Hover provider for JS inside interpolation ---
             monaco.languages.registerHoverProvider(LANGUAGE_ID, {
                 async provideHover(model, position) {
-                    const offset = model.getOffsetAt(position);
+                    const ctx = getInterpolationContext(model, position);
+                    if (!ctx) return null;
 
-                    if (isInsideInterpolation(model, offset)) {
-                        try {
-                            const getWorker = await monaco.languages.typescript.getJavaScriptWorker();
-                            const worker = await getWorker(model.uri);
-                            const info = await worker.getQuickInfoAtPosition(model.uri.toString(), offset);
+                    try {
+                        // Create/update virtual JS model with just the expression
+                        const jsModel = getOrCreateVirtualJsModel();
+                        jsModel.setValue(ctx.expression);
 
-                            if (!info) return null;
+                        const getWorker = await monaco.languages.typescript.getJavaScriptWorker();
+                        const worker = await getWorker(VIRTUAL_JS_URI);
+                        const info = await worker.getQuickInfoAtPosition(
+                            VIRTUAL_JS_URI.toString(),
+                            ctx.offsetInExpression
+                        );
 
-                            const contents = [];
-                            if (info.displayParts) {
-                                const displayText = info.displayParts.map(p => p.text).join('');
-                                contents.push({ value: '```typescript\n' + displayText + '\n```' });
-                            }
-                            if (info.documentation && info.documentation.length > 0) {
-                                const docText = info.documentation.map(p => p.text).join('');
-                                contents.push({ value: docText });
-                            }
+                        if (!info) return null;
 
-                            if (contents.length === 0) return null;
-
-                            const wordInfo = model.getWordAtPosition(position);
-                            const range = wordInfo ? {
-                                startLineNumber: position.lineNumber,
-                                startColumn: wordInfo.startColumn,
-                                endLineNumber: position.lineNumber,
-                                endColumn: wordInfo.endColumn
-                            } : undefined;
-
-                            return { contents, range };
-                        } catch (e) {
-                            console.error('JS hover error:', e);
+                        const contents = [];
+                        if (info.displayParts) {
+                            const displayText = info.displayParts.map(p => p.text).join('');
+                            contents.push({ value: '```typescript\n' + displayText + '\n```' });
                         }
+                        if (info.documentation && info.documentation.length > 0) {
+                            const docText = info.documentation.map(p => p.text).join('');
+                            contents.push({ value: docText });
+                        }
+
+                        if (contents.length === 0) return null;
+
+                        const wordInfo = model.getWordAtPosition(position);
+                        const range = wordInfo ? {
+                            startLineNumber: position.lineNumber,
+                            startColumn: wordInfo.startColumn,
+                            endLineNumber: position.lineNumber,
+                            endColumn: wordInfo.endColumn
+                        } : undefined;
+
+                        return { contents, range };
+                    } catch (e) {
+                        console.error('JS hover error:', e);
                     }
                     return null;
                 }

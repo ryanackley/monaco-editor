@@ -352,6 +352,12 @@ function getInterpolationContext(
 // --- Providers ---
 
 function registerProviders(defaults: LanguageServiceDefaultsImpl): void {
+	// Extended completion item with metadata for resolveCompletionItem
+	interface JsCompletionItem extends monaco.languages.CompletionItem {
+		uri: monaco.Uri;
+		offset: number;
+	}
+
 	// Completion provider - combines JSON completions with JS completions for interpolation
 	monaco.languages.registerCompletionItemProvider(LANGUAGE_ID, {
 		triggerCharacters: ['"', ':', ' ', '$', '{', '.'],
@@ -394,14 +400,20 @@ function registerProviders(defaults: LanguageServiceDefaultsImpl): void {
 						endColumn: wordInfo.endColumn
 					};
 
-					const suggestions: monaco.languages.CompletionItem[] = info.entries.map((entry: any) => ({
-						label: entry.name,
-						kind: convertTsCompletionKind(entry.kind),
-						detail: entry.kindModifiers,
-						sortText: entry.sortText,
-						insertText: entry.insertText || entry.name,
-						range: range
-					}));
+					// Filter out warning entries and add metadata for resolution
+					const suggestions: JsCompletionItem[] = info.entries
+						.filter((entry: any) => entry.kind !== TsKind.warning)
+						.map((entry: any) => ({
+							label: entry.name,
+							kind: convertTsCompletionKind(entry.kind),
+							detail: entry.kindModifiers,
+							sortText: entry.sortText,
+							insertText: entry.insertText || entry.name,
+							range: range,
+							// Metadata for resolveCompletionItem
+							uri: jsModel.uri,
+							offset: interpContext.offsetInExpression
+						}));
 
 					return { suggestions };
 				} catch (e) {
@@ -444,6 +456,49 @@ function registerProviders(defaults: LanguageServiceDefaultsImpl): void {
 			} catch (e) {
 				console.error('JSON completion error:', e);
 				return null;
+			}
+		},
+
+		async resolveCompletionItem(
+			item: monaco.languages.CompletionItem,
+			token: monaco.CancellationToken
+		): Promise<monaco.languages.CompletionItem> {
+			// Check if this is a JS completion item with our metadata
+			const jsItem = item as JsCompletionItem;
+			if (!jsItem.uri || jsItem.offset === undefined) {
+				return item;
+			}
+
+			const jsWorker = await getJavaScriptWorker(jsItem.uri);
+			if (!jsWorker) {
+				return item;
+			}
+
+			try {
+				const label = item.label;
+				const labelName = typeof label === 'string' ? label : label.label;
+				const details = await jsWorker.getCompletionEntryDetails(
+					jsItem.uri.toString(),
+					jsItem.offset,
+					labelName
+				);
+
+				if (!details) {
+					return item;
+				}
+
+				return {
+					...item,
+					label: details.name,
+					kind: convertTsCompletionKind(details.kind),
+					detail: displayPartsToString(details.displayParts),
+					documentation: {
+						value: createDocumentationString(details)
+					}
+				};
+			} catch (e) {
+				console.error('JS completion resolve error:', e);
+				return item;
 			}
 		}
 	});
@@ -983,33 +1038,119 @@ function convertCompletionItemKind(kind: number): monaco.languages.CompletionIte
 	return kindMap[kind] || monaco.languages.CompletionItemKind.Property;
 }
 
+// TypeScript ScriptElementKind values
+const TsKind = {
+	unknown: '',
+	keyword: 'keyword',
+	script: 'script',
+	module: 'module',
+	class: 'class',
+	interface: 'interface',
+	type: 'type',
+	enum: 'enum',
+	variable: 'var',
+	localVariable: 'local var',
+	function: 'function',
+	localFunction: 'local function',
+	memberFunction: 'method',
+	memberGetAccessor: 'getter',
+	memberSetAccessor: 'setter',
+	memberVariable: 'property',
+	constructorImplementation: 'constructor',
+	callSignature: 'call',
+	indexSignature: 'index',
+	constructSignature: 'construct',
+	parameter: 'parameter',
+	typeParameter: 'type parameter',
+	primitiveType: 'primitive type',
+	label: 'label',
+	alias: 'alias',
+	const: 'const',
+	let: 'let',
+	warning: 'warning'
+} as const;
+
 function convertTsCompletionKind(kind: string): monaco.languages.CompletionItemKind {
-	const kindMap: { [key: string]: monaco.languages.CompletionItemKind } = {
-		primitive: monaco.languages.CompletionItemKind.Keyword,
-		keyword: monaco.languages.CompletionItemKind.Keyword,
-		var: monaco.languages.CompletionItemKind.Variable,
-		let: monaco.languages.CompletionItemKind.Variable,
-		const: monaco.languages.CompletionItemKind.Constant,
-		localVar: monaco.languages.CompletionItemKind.Variable,
-		function: monaco.languages.CompletionItemKind.Function,
-		localFunction: monaco.languages.CompletionItemKind.Function,
-		method: monaco.languages.CompletionItemKind.Method,
-		getter: monaco.languages.CompletionItemKind.Property,
-		setter: monaco.languages.CompletionItemKind.Property,
-		property: monaco.languages.CompletionItemKind.Property,
-		constructor: monaco.languages.CompletionItemKind.Constructor,
-		class: monaco.languages.CompletionItemKind.Class,
-		interface: monaco.languages.CompletionItemKind.Interface,
-		type: monaco.languages.CompletionItemKind.Interface,
-		enum: monaco.languages.CompletionItemKind.Enum,
-		enumMember: monaco.languages.CompletionItemKind.EnumMember,
-		module: monaco.languages.CompletionItemKind.Module,
-		alias: monaco.languages.CompletionItemKind.Variable,
-		typeParameter: monaco.languages.CompletionItemKind.TypeParameter,
-		parameter: monaco.languages.CompletionItemKind.Variable,
-		string: monaco.languages.CompletionItemKind.Value
-	};
-	return kindMap[kind] || monaco.languages.CompletionItemKind.Property;
+	switch (kind) {
+		case TsKind.primitiveType:
+		case TsKind.keyword:
+			return monaco.languages.CompletionItemKind.Keyword;
+		case TsKind.variable:
+		case TsKind.localVariable:
+			return monaco.languages.CompletionItemKind.Variable;
+		case TsKind.memberVariable:
+		case TsKind.memberGetAccessor:
+		case TsKind.memberSetAccessor:
+			return monaco.languages.CompletionItemKind.Field;
+		case TsKind.function:
+		case TsKind.localFunction:
+		case TsKind.memberFunction:
+		case TsKind.constructSignature:
+		case TsKind.callSignature:
+		case TsKind.indexSignature:
+			return monaco.languages.CompletionItemKind.Function;
+		case TsKind.enum:
+			return monaco.languages.CompletionItemKind.Enum;
+		case TsKind.module:
+		case TsKind.script:
+			return monaco.languages.CompletionItemKind.Module;
+		case TsKind.class:
+			return monaco.languages.CompletionItemKind.Class;
+		case TsKind.interface:
+		case TsKind.type:
+			return monaco.languages.CompletionItemKind.Interface;
+		case TsKind.const:
+			return monaco.languages.CompletionItemKind.Constant;
+		case TsKind.let:
+		case TsKind.parameter:
+		case TsKind.alias:
+			return monaco.languages.CompletionItemKind.Variable;
+		case TsKind.typeParameter:
+			return monaco.languages.CompletionItemKind.TypeParameter;
+		case TsKind.constructorImplementation:
+			return monaco.languages.CompletionItemKind.Constructor;
+		default:
+			return monaco.languages.CompletionItemKind.Property;
+	}
+}
+
+// Helper functions for TypeScript completion details
+function displayPartsToString(displayParts: Array<{ text: string }> | undefined): string {
+	if (displayParts) {
+		return displayParts.map((part) => part.text).join('');
+	}
+	return '';
+}
+
+function tagToString(tag: { name: string; text?: string | Array<{ text: string }> }): string {
+	let tagLabel = `*@${tag.name}*`;
+	if (tag.name === 'param' && tag.text) {
+		if (Array.isArray(tag.text)) {
+			const [paramName, ...rest] = tag.text;
+			tagLabel += ` \`${paramName.text}\``;
+			if (rest.length > 0) {
+				tagLabel += ` — ${rest.map((r) => r.text).join(' ')}`;
+			}
+		}
+	} else if (Array.isArray(tag.text)) {
+		tagLabel += ` — ${tag.text.map((r) => r.text).join(' ')}`;
+	} else if (tag.text) {
+		tagLabel += ` — ${tag.text}`;
+	}
+	return tagLabel;
+}
+
+function createDocumentationString(details: {
+	documentation?: Array<{ text: string }>;
+	tags?: Array<{ name: string; text?: string | Array<{ text: string }> }>;
+}): string {
+	let documentationString = displayPartsToString(details.documentation);
+	if (details.tags) {
+		for (const tag of details.tags) {
+			documentationString += `\n\n${tagToString(tag)}`;
+		}
+	}
+	return documentationString;
 }
 
 function convertSymbolKind(kind: number): monaco.languages.SymbolKind {

@@ -167,39 +167,34 @@
             // This must be done before the worker is used
             monaco.languages.typescript.javascriptDefaults.setCompilerOptions({
                 allowNonTsExtensions: true,
-                allowJs: true,
-                checkJs: false,
-                noLib: true,
-                target: monaco.languages.typescript.ScriptTarget.ESNext
             });
-
-            monaco.languages.typescript.javascriptDefaults.setExtraLibs([
-                {
-                    content: `
+            const libSrc1 = `
 /** The name to greet */
-declare const name: string;
+const name: string;
 /** Current environment */
-declare const env: string;
+const env: string;
 /** Application configuration */
-declare const config: { debug: boolean; port: number };
+const config: { debug: boolean; port: number };
 /** Base API URL */
-declare const API_URL: string;
+const API_URL: string;
 /** Application version */
-declare const VERSION: string;
+const VERSION: string;
 
 /** Format a date to string */
-declare function formatDate(date: Date): string;
+function formatDate(date: Date): string;
 /** Capitalize a string */
-declare function capitalize(str: string): string;
-`,
-                    filePath: 'file:///globals.d.ts'
+function capitalize(str: string): string;
+`;
+            monaco.languages.typescript.javascriptDefaults.setExtraLibs([
+                {
+                    content: libSrc1
                 }
             ]);
 
             // Create a dummy JS model to initialize the JavaScript worker
             // This ensures the worker is ready when we need it
-            const dummyModel = monaco.editor.createModel('', 'javascript');
-            dummyModel.dispose();
+            var libUri = "ts:filename/facts.d.ts";
+            monaco.editor.createModel(libSrc1, "javascript", monaco.Uri.parse(libUri)); 
 
             // --- Helper to check if inside interpolation using tokenization ---
             function isInsideInterpolation(model, offset) {

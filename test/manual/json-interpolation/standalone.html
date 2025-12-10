@@ -51,6 +51,111 @@
         });
 
         require(['vs/editor/editor.main'], function() {
+
+            function displayPartsToString(displayParts) {
+    if (displayParts) {
+        return displayParts.map((displayPart) => displayPart.text).join('');
+    }
+    return '';
+}
+function tagToString(tag) {
+    let tagLabel = `*@${tag.name}*`;
+    if (tag.name === 'param' && tag.text) {
+        const [paramName, ...rest] = tag.text;
+        tagLabel += `\`${paramName.text}\``;
+        if (rest.length > 0) tagLabel += ` — ${rest.map((r) => r.text).join(' ')}`;
+    } else if (Array.isArray(tag.text)) {
+        tagLabel += ` — ${tag.text.map((r) => r.text).join(' ')}`;
+    } else if (tag.text) {
+        tagLabel += ` — ${tag.text}`;
+    }
+    return tagLabel;
+}
+const Kind = {
+    "unknown": '',
+    keyword: 'keyword',
+    script: 'script',
+    module: 'module',
+    class: 'class',
+    interface: 'interface',
+    type: 'type',
+    enum: 'enum',
+    variable: 'var',
+    localVariable: 'local var',
+    function: 'function',
+    localFunction: 'local function',
+    memberFunction: 'method',
+    memberGetAccessor: 'getter',
+    memberSetAccessor: 'setter',
+    memberVariable: 'property',
+    constructorImplementation: 'constructor',
+    callSignature: 'call',
+    indexSignature: 'index',
+    constructSignature: 'construct',
+    parameter: 'parameter',
+    typeParameter: 'type parameter',
+    primitiveType: 'primitive type',
+    label: 'label',
+    alias: 'alias',
+    const: 'const',
+    let: 'let',
+    warning: 'warning',
+};
+function convertKindToOrder(kind){
+        switch(kind) {
+            case monaco.languages.CompletionItemKind.Field:
+                return 0;
+            case monaco.languages.CompletionItemKind.Variable:
+                return 1;
+            default:
+                return 2;
+        }
+
+    }
+
+    function convertKind(kind){
+        switch (kind) {
+            case Kind.primitiveType:
+            case Kind.keyword:
+                return monaco.languages.CompletionItemKind.Keyword;
+            case Kind.variable:
+            case Kind.localVariable:
+                return monaco.languages.CompletionItemKind.Variable;
+            case Kind.memberVariable:
+            case Kind.memberGetAccessor:
+            case Kind.memberSetAccessor:
+                return monaco.languages.CompletionItemKind.Field;
+            case Kind.function:
+            case Kind.memberFunction:
+            case Kind.constructSignature:
+            case Kind.callSignature:
+            case Kind.indexSignature:
+                return monaco.languages.CompletionItemKind.Function;
+            case Kind.enum:
+                return monaco.languages.CompletionItemKind.Enum;
+            case Kind.module:
+                return monaco.languages.CompletionItemKind.Module;
+            case Kind.class:
+                return monaco.languages.CompletionItemKind.Class;
+            case Kind.interface:
+                return monaco.languages.CompletionItemKind.Interface;
+            case Kind.warning:
+                return monaco.languages.CompletionItemKind;
+        }
+
+        return monaco.languages.CompletionItemKind.Property;
+    }
+
+    function createDocumentationString(details) {
+        let documentationString = displayPartsToString(details.documentation);
+        if (details.tags) {
+            for (const tag of details.tags) {
+                documentationString += `\n\n${tagToString(tag)}`;
+            }
+        }
+        return documentationString;
+    }
+
             // --- Register json-interpolation language ---
 
             const LANGUAGE_ID = 'json-interpolation';
@@ -167,6 +272,7 @@
             // This must be done before the worker is used
             monaco.languages.typescript.javascriptDefaults.setCompilerOptions({
                 allowNonTsExtensions: true,
+                lib:["es2015"]
             });
             const libSrc1 = `
 /** The name to greet */
@@ -348,9 +454,12 @@ function capitalize(str: string): string;
                             endColumn: wordInfo.endColumn
                         };
 
-                        const suggestions = info.entries.map(entry => ({
+                        const suggestions = info.entries.filter(entry=> entry.kind != Kind.warning).map(entry => ({
+                            uri: jsModel.uri,
+                            position: position,
+                            offset: ctx.offsetInExpression,
                             label: entry.name,
-                            kind: monaco.languages.CompletionItemKind.Variable,
+                            kind: convertKind(entry.kind),
                             detail: entry.kindModifiers,
                             sortText: entry.sortText,
                             insertText: entry.insertText || entry.name,
@@ -362,7 +471,42 @@ function capitalize(str: string): string;
                         console.error('JS completion error:', e);
                     }
                     return null;
-                }
+                },
+
+                async resolveCompletionItem(
+        item,
+        token
+    ) {
+        const myItem = item;
+        const resource = myItem.uri;
+        const position = myItem.position;
+        const offset = myItem.offset;
+
+        // Use the same temp JavaScript model approach for consistency
+        //const tempUri = monaco.Uri.parse("ts:filename/temp-completion.js");
+        const getWorker = await monaco.languages.typescript.getJavaScriptWorker();
+                        const worker = await getWorker(VIRTUAL_JS_URI);
+        const details = await worker.getCompletionEntryDetails(
+            resource.toString(),
+            offset,
+            myItem.label
+        );
+        if (!details) {
+            return myItem;
+        }
+        const returnVal= {
+            uri: resource,
+            position: position,
+            label: details.name,
+            kind: convertKind(details.kind),
+            detail: displayPartsToString(details.displayParts),
+            documentation: {
+                value: createDocumentationString(details)
+            }
+        };
+        return returnVal;
+    },
+    
             });
 
             // --- Hover provider for JS inside interpolation ---
@@ -442,7 +586,8 @@ function capitalize(str: string): string;
                 minimap: { enabled: false },
                 automaticLayout: true,
                 fontSize: 14,
-                tabSize: 2
+                tabSize: 2,
+                quickSuggestions: false
             });
 
             console.log('JSON Interpolation editor initialized');

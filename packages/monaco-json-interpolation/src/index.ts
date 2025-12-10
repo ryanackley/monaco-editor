@@ -196,14 +196,40 @@ async function getJavaScriptWorker(resource: monaco.Uri): Promise<JSWorker | nul
 	}
 }
 
-// --- Check if position is inside interpolation using tokenization ---
+// --- Virtual JavaScript model for interpolation completions ---
 
-function isInsideInterpolation(model: monaco.editor.ITextModel, offset: number): boolean {
-	// Tokenize the content and check if we're in an embedded JS region
+const VIRTUAL_JS_URI_BASE = 'file:///interpolation-expr-';
+let virtualJsModelCounter = 0;
+let virtualJsModel: monaco.editor.ITextModel | null = null;
+
+function getOrCreateVirtualJsModel(): monaco.editor.ITextModel {
+	if (!virtualJsModel || virtualJsModel.isDisposed()) {
+		const uri = monaco.Uri.parse(`${VIRTUAL_JS_URI_BASE}${virtualJsModelCounter++}.js`);
+		virtualJsModel = monaco.editor.createModel('', 'javascript', uri);
+	}
+	return virtualJsModel;
+}
+
+// --- Helper to extract interpolation context using tokenization ---
+
+interface InterpolationContext {
+	expression: string;
+	expressionStart: number;
+	expressionEnd: number;
+	offsetInExpression: number;
+}
+
+interface FlatToken {
+	startOffset: number;
+	endOffset: number;
+	type: string;
+}
+
+function flattenTokens(model: monaco.editor.ITextModel): FlatToken[] {
 	const source = model.getValue();
 	const tokenLines = monaco.editor.tokenize(source, LANGUAGE_ID);
+	const tokens: FlatToken[] = [];
 
-	// Flatten tokens and find which one contains our offset
 	let currentOffset = 0;
 	for (let lineIdx = 0; lineIdx < tokenLines.length; lineIdx++) {
 		const lineTokens = tokenLines[lineIdx];
@@ -212,21 +238,115 @@ function isInsideInterpolation(model: monaco.editor.ITextModel, offset: number):
 		for (let tokenIdx = 0; tokenIdx < lineTokens.length; tokenIdx++) {
 			const token = lineTokens[tokenIdx];
 			const nextToken = lineTokens[tokenIdx + 1];
-			const tokenStart = currentOffset + token.offset;
-			const tokenEnd = nextToken
+			const startOffset = currentOffset + token.offset;
+			const endOffset = nextToken
 				? currentOffset + nextToken.offset
 				: currentOffset + lineContent.length;
 
-			if (offset >= tokenStart && offset <= tokenEnd) {
-				// Check if this token is in an embedded JavaScript region
-				// The embedded JS tokens won't have our language's postfix
-				return !token.type.endsWith('.json-interpolation') && token.type !== '';
-			}
+			tokens.push({
+				startOffset,
+				endOffset,
+				type: token.type
+			});
 		}
 		currentOffset += lineContent.length + 1; // +1 for newline
 	}
 
-	return false;
+	return tokens;
+}
+
+function getInterpolationContext(
+	model: monaco.editor.ITextModel,
+	offset: number
+): InterpolationContext | null {
+	const tokens = flattenTokens(model);
+	const text = model.getValue();
+
+	// Find the token at the current offset
+	let currentTokenIdx = -1;
+	for (let i = 0; i < tokens.length; i++) {
+		const token = tokens[i];
+		if (offset >= token.startOffset && offset <= token.endOffset) {
+			currentTokenIdx = i;
+			break;
+		}
+	}
+
+	if (currentTokenIdx === -1) {
+		return null;
+	}
+
+	const currentToken = tokens[currentTokenIdx];
+
+	// Check if we're in an embedded JavaScript region
+	// Embedded JS tokens don't have the .json-interpolation postfix
+	const isInEmbeddedJs = !currentToken.type.endsWith('.json-interpolation') && currentToken.type !== '';
+
+	if (!isInEmbeddedJs) {
+		// Also check if we're right after the ${ delimiter
+		if (currentToken.type === 'delimiter.bracket.interpolation.json-interpolation') {
+			// Check if this is an opening ${ (look at text)
+			const tokenText = text.substring(currentToken.startOffset, currentToken.endOffset);
+			if (tokenText === '${' && offset === currentToken.endOffset) {
+				// Cursor is right after ${, find the closing }
+				for (let i = currentTokenIdx + 1; i < tokens.length; i++) {
+					if (tokens[i].type === 'delimiter.bracket.interpolation.json-interpolation') {
+						const expressionStart = currentToken.endOffset;
+						const expressionEnd = tokens[i].startOffset;
+						return {
+							expression: text.substring(expressionStart, expressionEnd),
+							expressionStart,
+							expressionEnd,
+							offsetInExpression: offset - expressionStart
+						};
+					}
+				}
+			}
+		}
+		return null;
+	}
+
+	// Walk backwards to find the ${ delimiter
+	let interpolationStartOffset = -1;
+	for (let i = currentTokenIdx - 1; i >= 0; i--) {
+		const token = tokens[i];
+		if (token.type === 'delimiter.bracket.interpolation.json-interpolation') {
+			const tokenText = text.substring(token.startOffset, token.endOffset);
+			if (tokenText === '${') {
+				interpolationStartOffset = token.endOffset; // After the ${
+				break;
+			}
+		}
+	}
+
+	if (interpolationStartOffset === -1) {
+		return null;
+	}
+
+	// Walk forwards to find the closing } delimiter
+	let interpolationEndOffset = -1;
+	for (let i = currentTokenIdx + 1; i < tokens.length; i++) {
+		const token = tokens[i];
+		if (token.type === 'delimiter.bracket.interpolation.json-interpolation') {
+			interpolationEndOffset = token.startOffset; // Before the }
+			break;
+		}
+	}
+
+	if (interpolationEndOffset === -1) {
+		// No closing brace found yet, use end of text
+		interpolationEndOffset = text.length;
+	}
+
+	const expression = text.substring(interpolationStartOffset, interpolationEndOffset);
+	const offsetInExpression = offset - interpolationStartOffset;
+
+	return {
+		expression,
+		expressionStart: interpolationStartOffset,
+		expressionEnd: interpolationEndOffset,
+		offsetInExpression
+	};
 }
 
 // --- Providers ---
@@ -243,20 +363,23 @@ function registerProviders(defaults: LanguageServiceDefaultsImpl): void {
 		): Promise<monaco.languages.CompletionList | null> {
 			const offset = model.getOffsetAt(position);
 
-			// Check if we're inside an interpolation using tokenization
-			if (isInsideInterpolation(model, offset)) {
-				// Use JavaScript worker for completions inside interpolation
-				// Monaco syncs the model content automatically with nextEmbedded
-				const jsWorker = await getJavaScriptWorker(model.uri);
+			// Check if we're inside an interpolation using text analysis
+			const interpContext = getInterpolationContext(model, offset);
+			if (interpContext) {
+				// Use virtual JavaScript model for completions
+				const jsModel = getOrCreateVirtualJsModel();
+				jsModel.setValue(interpContext.expression);
+
+				const jsWorker = await getJavaScriptWorker(jsModel.uri);
 				if (!jsWorker) {
 					return null;
 				}
 
 				try {
-					// Get completions from JavaScript worker directly on the model's URI
+					// Get completions from JavaScript worker on the virtual model
 					const info = await jsWorker.getCompletionsAtPosition(
-						model.uri.toString(),
-						offset
+						jsModel.uri.toString(),
+						interpContext.offsetInExpression
 					);
 
 					if (!info || !info.entries) {
@@ -333,19 +456,23 @@ function registerProviders(defaults: LanguageServiceDefaultsImpl): void {
 		): Promise<monaco.languages.Hover | null> {
 			const offset = model.getOffsetAt(position);
 
-			// Check if we're inside an interpolation using tokenization
-			if (isInsideInterpolation(model, offset)) {
-				// Use JavaScript worker for hover inside interpolation
-				const jsWorker = await getJavaScriptWorker(model.uri);
+			// Check if we're inside an interpolation using text analysis
+			const interpContext = getInterpolationContext(model, offset);
+			if (interpContext) {
+				// Use virtual JavaScript model for hover
+				const jsModel = getOrCreateVirtualJsModel();
+				jsModel.setValue(interpContext.expression);
+
+				const jsWorker = await getJavaScriptWorker(jsModel.uri);
 				if (!jsWorker) {
 					return null;
 				}
 
 				try {
-					// Get quick info from JavaScript worker directly on the model's URI
+					// Get quick info from JavaScript worker on the virtual model
 					const info = await jsWorker.getQuickInfoAtPosition(
-						model.uri.toString(),
-						offset
+						jsModel.uri.toString(),
+						interpContext.offsetInExpression
 					);
 
 					if (!info) {
@@ -435,19 +562,24 @@ function registerProviders(defaults: LanguageServiceDefaultsImpl): void {
 			const offset = model.getOffsetAt(position);
 
 			// Only provide signature help inside interpolations
-			if (!isInsideInterpolation(model, offset)) {
+			const interpContext = getInterpolationContext(model, offset);
+			if (!interpContext) {
 				return null;
 			}
 
-			const jsWorker = await getJavaScriptWorker(model.uri);
+			// Use virtual JavaScript model for signature help
+			const jsModel = getOrCreateVirtualJsModel();
+			jsModel.setValue(interpContext.expression);
+
+			const jsWorker = await getJavaScriptWorker(jsModel.uri);
 			if (!jsWorker) {
 				return null;
 			}
 
 			try {
 				const info = await jsWorker.getSignatureHelpItems(
-					model.uri.toString(),
-					offset
+					jsModel.uri.toString(),
+					interpContext.offsetInExpression
 				);
 
 				if (!info || !info.items || info.items.length === 0) {

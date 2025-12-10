@@ -196,10 +196,22 @@ function capitalize(str: string): string;
             var libUri = "ts:filename/facts.d.ts";
             monaco.editor.createModel(libSrc1, "javascript", monaco.Uri.parse(libUri)); 
 
-            // --- Helper to check if inside interpolation using tokenization ---
-            function isInsideInterpolation(model, offset) {
+            // --- Virtual model for JavaScript completions ---
+            const VIRTUAL_JS_URI = monaco.Uri.parse('file:///interpolation-expr.js');
+            let virtualJsModel = null;
+
+            function getOrCreateVirtualJsModel() {
+                if (!virtualJsModel || virtualJsModel.isDisposed()) {
+                    virtualJsModel = monaco.editor.createModel('', 'javascript', VIRTUAL_JS_URI);
+                }
+                return virtualJsModel;
+            }
+
+            // --- Helper to flatten tokens into absolute offsets ---
+            function flattenTokens(model) {
                 const source = model.getValue();
                 const tokenLines = monaco.editor.tokenize(source, LANGUAGE_ID);
+                const tokens = [];
 
                 let currentOffset = 0;
                 for (let lineIdx = 0; lineIdx < tokenLines.length; lineIdx++) {
@@ -209,19 +221,101 @@ function capitalize(str: string): string;
                     for (let tokenIdx = 0; tokenIdx < lineTokens.length; tokenIdx++) {
                         const token = lineTokens[tokenIdx];
                         const nextToken = lineTokens[tokenIdx + 1];
-                        const tokenStart = currentOffset + token.offset;
-                        const tokenEnd = nextToken
+                        const startOffset = currentOffset + token.offset;
+                        const endOffset = nextToken
                             ? currentOffset + nextToken.offset
                             : currentOffset + lineContent.length;
 
-                        if (offset >= tokenStart && offset <= tokenEnd) {
-                            // Check if in embedded JS (token type doesn't end with our language)
-                            return !token.type.endsWith('.json-interpolation') && token.type !== '';
+                        tokens.push({ startOffset, endOffset, type: token.type });
+                    }
+                    currentOffset += lineContent.length + 1; // +1 for newline
+                }
+                return tokens;
+            }
+
+            // --- Helper to extract interpolation context using tokenization ---
+            function getInterpolationContext(model, position) {
+                const tokens = flattenTokens(model);
+                const text = model.getValue();
+                const offset = model.getOffsetAt(position);
+
+                // Find the token at the current offset
+                let currentTokenIdx = -1;
+                for (let i = 0; i < tokens.length; i++) {
+                    const token = tokens[i];
+                    if (offset >= token.startOffset && offset <= token.endOffset) {
+                        currentTokenIdx = i;
+                        break;
+                    }
+                }
+
+                if (currentTokenIdx === -1) return null;
+
+                const currentToken = tokens[currentTokenIdx];
+
+                // Check if we're in an embedded JavaScript region
+                // Embedded JS tokens don't have the .json-interpolation postfix
+                const isInEmbeddedJs = !currentToken.type.endsWith('.json-interpolation') && currentToken.type !== '';
+
+                if (!isInEmbeddedJs) {
+                    // Also check if we're right after the ${ delimiter
+                    if (currentToken.type === 'delimiter.bracket.interpolation.json-interpolation') {
+                        const tokenText = text.substring(currentToken.startOffset, currentToken.endOffset);
+                        if (tokenText === '${' && offset === currentToken.endOffset) {
+                            // Cursor is right after ${, find the closing }
+                            for (let i = currentTokenIdx + 1; i < tokens.length; i++) {
+                                if (tokens[i].type === 'delimiter.bracket.interpolation.json-interpolation') {
+                                    const expressionStart = currentToken.endOffset;
+                                    const expressionEnd = tokens[i].startOffset;
+                                    return {
+                                        expression: text.substring(expressionStart, expressionEnd),
+                                        expressionStart,
+                                        expressionEnd,
+                                        offsetInExpression: offset - expressionStart
+                                    };
+                                }
+                            }
                         }
                     }
-                    currentOffset += lineContent.length + 1;
+                    return null;
                 }
-                return false;
+
+                // Walk backwards to find the ${ delimiter
+                let interpolationStartOffset = -1;
+                for (let i = currentTokenIdx - 1; i >= 0; i--) {
+                    const token = tokens[i];
+                    if (token.type === 'delimiter.bracket.interpolation.json-interpolation') {
+                        const tokenText = text.substring(token.startOffset, token.endOffset);
+                        if (tokenText === '${') {
+                            interpolationStartOffset = token.endOffset;
+                            break;
+                        }
+                    }
+                }
+
+                if (interpolationStartOffset === -1) return null;
+
+                // Walk forwards to find the closing } delimiter
+                let interpolationEndOffset = -1;
+                for (let i = currentTokenIdx + 1; i < tokens.length; i++) {
+                    const token = tokens[i];
+                    if (token.type === 'delimiter.bracket.interpolation.json-interpolation') {
+                        interpolationEndOffset = token.startOffset;
+                        break;
+                    }
+                }
+
+                if (interpolationEndOffset === -1) {
+                    interpolationEndOffset = text.length;
+                }
+
+                const expression = text.substring(interpolationStartOffset, interpolationEndOffset);
+                return {
+                    expression,
+                    expressionStart: interpolationStartOffset,
+                    expressionEnd: interpolationEndOffset,
+                    offsetInExpression: offset - interpolationStartOffset
+                };
             }
 
             // --- Completion provider for JS inside interpolation ---
@@ -229,37 +323,43 @@ function capitalize(str: string): string;
                 triggerCharacters: ['"', ':', ' ', '$', '{', '.'],
 
                 async provideCompletionItems(model, position) {
-                    const offset = model.getOffsetAt(position);
+                    const ctx = getInterpolationContext(model, position);
+                    if (!ctx) return null;
 
-                    if (isInsideInterpolation(model, offset)) {
-                        try {
-                            const getWorker = await monaco.languages.typescript.getJavaScriptWorker();
-                            const worker = await getWorker(model.uri);
-                            const info = await worker.getCompletionsAtPosition(model.uri.toString(), offset);
+                    try {
+                        // Create/update virtual JS model with just the expression
+                        const jsModel = getOrCreateVirtualJsModel();
+                        jsModel.setValue(ctx.expression);
 
-                            if (!info || !info.entries) return null;
+                        const getWorker = await monaco.languages.typescript.getJavaScriptWorker();
+                        const worker = await getWorker(VIRTUAL_JS_URI);
+                        const info = await worker.getCompletionsAtPosition(
+                            VIRTUAL_JS_URI.toString(),
+                            ctx.offsetInExpression
+                        );
 
-                            const wordInfo = model.getWordUntilPosition(position);
-                            const range = {
-                                startLineNumber: position.lineNumber,
-                                startColumn: wordInfo.startColumn,
-                                endLineNumber: position.lineNumber,
-                                endColumn: wordInfo.endColumn
-                            };
+                        if (!info || !info.entries) return null;
 
-                            const suggestions = info.entries.map(entry => ({
-                                label: entry.name,
-                                kind: monaco.languages.CompletionItemKind.Variable,
-                                detail: entry.kindModifiers,
-                                sortText: entry.sortText,
-                                insertText: entry.insertText || entry.name,
-                                range: range
-                            }));
+                        const wordInfo = model.getWordUntilPosition(position);
+                        const range = {
+                            startLineNumber: position.lineNumber,
+                            startColumn: wordInfo.startColumn,
+                            endLineNumber: position.lineNumber,
+                            endColumn: wordInfo.endColumn
+                        };
 
-                            return { suggestions };
-                        } catch (e) {
-                            console.error('JS completion error:', e);
-                        }
+                        const suggestions = info.entries.map(entry => ({
+                            label: entry.name,
+                            kind: monaco.languages.CompletionItemKind.Variable,
+                            detail: entry.kindModifiers,
+                            sortText: entry.sortText,
+                            insertText: entry.insertText || entry.name,
+                            range: range
+                        }));
+
+                        return { suggestions };
+                    } catch (e) {
+                        console.error('JS completion error:', e);
                     }
                     return null;
                 }
@@ -268,40 +368,46 @@ function capitalize(str: string): string;
             // --- Hover provider for JS inside interpolation ---
             monaco.languages.registerHoverProvider(LANGUAGE_ID, {
                 async provideHover(model, position) {
-                    const offset = model.getOffsetAt(position);
+                    const ctx = getInterpolationContext(model, position);
+                    if (!ctx) return null;
 
-                    if (isInsideInterpolation(model, offset)) {
-                        try {
-                            const getWorker = await monaco.languages.typescript.getJavaScriptWorker();
-                            const worker = await getWorker(model.uri);
-                            const info = await worker.getQuickInfoAtPosition(model.uri.toString(), offset);
+                    try {
+                        // Create/update virtual JS model with just the expression
+                        const jsModel = getOrCreateVirtualJsModel();
+                        jsModel.setValue(ctx.expression);
 
-                            if (!info) return null;
+                        const getWorker = await monaco.languages.typescript.getJavaScriptWorker();
+                        const worker = await getWorker(VIRTUAL_JS_URI);
+                        const info = await worker.getQuickInfoAtPosition(
+                            VIRTUAL_JS_URI.toString(),
+                            ctx.offsetInExpression
+                        );
 
-                            const contents = [];
-                            if (info.displayParts) {
-                                const displayText = info.displayParts.map(p => p.text).join('');
-                                contents.push({ value: '```typescript\n' + displayText + '\n```' });
-                            }
-                            if (info.documentation && info.documentation.length > 0) {
-                                const docText = info.documentation.map(p => p.text).join('');
-                                contents.push({ value: docText });
-                            }
+                        if (!info) return null;
 
-                            if (contents.length === 0) return null;
-
-                            const wordInfo = model.getWordAtPosition(position);
-                            const range = wordInfo ? {
-                                startLineNumber: position.lineNumber,
-                                startColumn: wordInfo.startColumn,
-                                endLineNumber: position.lineNumber,
-                                endColumn: wordInfo.endColumn
-                            } : undefined;
-
-                            return { contents, range };
-                        } catch (e) {
-                            console.error('JS hover error:', e);
+                        const contents = [];
+                        if (info.displayParts) {
+                            const displayText = info.displayParts.map(p => p.text).join('');
+                            contents.push({ value: '```typescript\n' + displayText + '\n```' });
                         }
+                        if (info.documentation && info.documentation.length > 0) {
+                            const docText = info.documentation.map(p => p.text).join('');
+                            contents.push({ value: docText });
+                        }
+
+                        if (contents.length === 0) return null;
+
+                        const wordInfo = model.getWordAtPosition(position);
+                        const range = wordInfo ? {
+                            startLineNumber: position.lineNumber,
+                            startColumn: wordInfo.startColumn,
+                            endLineNumber: position.lineNumber,
+                            endColumn: wordInfo.endColumn
+                        } : undefined;
+
+                        return { contents, range };
+                    } catch (e) {
+                        console.error('JS hover error:', e);
                     }
                     return null;
                 }

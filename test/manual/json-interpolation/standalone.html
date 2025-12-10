@@ -212,48 +212,114 @@ declare function capitalize(str: string): string;
                 return virtualJsModel;
             }
 
-            // --- Helper to extract interpolation context at a position ---
+            // --- Helper to flatten tokens into absolute offsets ---
+            function flattenTokens(model) {
+                const source = model.getValue();
+                const tokenLines = monaco.editor.tokenize(source, LANGUAGE_ID);
+                const tokens = [];
+
+                let currentOffset = 0;
+                for (let lineIdx = 0; lineIdx < tokenLines.length; lineIdx++) {
+                    const lineTokens = tokenLines[lineIdx];
+                    const lineContent = model.getLineContent(lineIdx + 1);
+
+                    for (let tokenIdx = 0; tokenIdx < lineTokens.length; tokenIdx++) {
+                        const token = lineTokens[tokenIdx];
+                        const nextToken = lineTokens[tokenIdx + 1];
+                        const startOffset = currentOffset + token.offset;
+                        const endOffset = nextToken
+                            ? currentOffset + nextToken.offset
+                            : currentOffset + lineContent.length;
+
+                        tokens.push({ startOffset, endOffset, type: token.type });
+                    }
+                    currentOffset += lineContent.length + 1; // +1 for newline
+                }
+                return tokens;
+            }
+
+            // --- Helper to extract interpolation context using tokenization ---
             function getInterpolationContext(model, position) {
+                const tokens = flattenTokens(model);
                 const text = model.getValue();
                 const offset = model.getOffsetAt(position);
 
-                // Find the ${ that contains the current position
-                const beforeCursor = text.substring(0, offset);
-                const lastStart = beforeCursor.lastIndexOf('${');
+                // Find the token at the current offset
+                let currentTokenIdx = -1;
+                for (let i = 0; i < tokens.length; i++) {
+                    const token = tokens[i];
+                    if (offset >= token.startOffset && offset <= token.endOffset) {
+                        currentTokenIdx = i;
+                        break;
+                    }
+                }
 
-                if (lastStart === -1) {
+                if (currentTokenIdx === -1) return null;
+
+                const currentToken = tokens[currentTokenIdx];
+
+                // Check if we're in an embedded JavaScript region
+                // Embedded JS tokens don't have the .json-interpolation postfix
+                const isInEmbeddedJs = !currentToken.type.endsWith('.json-interpolation') && currentToken.type !== '';
+
+                if (!isInEmbeddedJs) {
+                    // Also check if we're right after the ${ delimiter
+                    if (currentToken.type === 'delimiter.bracket.interpolation.json-interpolation') {
+                        const tokenText = text.substring(currentToken.startOffset, currentToken.endOffset);
+                        if (tokenText === '${' && offset === currentToken.endOffset) {
+                            // Cursor is right after ${, find the closing }
+                            for (let i = currentTokenIdx + 1; i < tokens.length; i++) {
+                                if (tokens[i].type === 'delimiter.bracket.interpolation.json-interpolation') {
+                                    const expressionStart = currentToken.endOffset;
+                                    const expressionEnd = tokens[i].startOffset;
+                                    return {
+                                        expression: text.substring(expressionStart, expressionEnd),
+                                        expressionStart,
+                                        expressionEnd,
+                                        offsetInExpression: offset - expressionStart
+                                    };
+                                }
+                            }
+                        }
+                    }
                     return null;
                 }
 
-                // Check if there's a closing } between ${ and cursor
-                const betweenStartAndCursor = text.substring(lastStart + 2, offset);
-                if (betweenStartAndCursor.includes('}')) {
-                    return null;
-                }
-
-                // Find the closing } (handle nested braces)
-                let depth = 1;
-                let endOffset = offset;
-                for (let i = offset; i < text.length; i++) {
-                    if (text[i] === '{') depth++;
-                    else if (text[i] === '}') {
-                        depth--;
-                        if (depth === 0) {
-                            endOffset = i;
+                // Walk backwards to find the ${ delimiter
+                let interpolationStartOffset = -1;
+                for (let i = currentTokenIdx - 1; i >= 0; i--) {
+                    const token = tokens[i];
+                    if (token.type === 'delimiter.bracket.interpolation.json-interpolation') {
+                        const tokenText = text.substring(token.startOffset, token.endOffset);
+                        if (tokenText === '${') {
+                            interpolationStartOffset = token.endOffset;
                             break;
                         }
                     }
                 }
 
-                // Extract the expression (content between ${ and })
-                const expressionStart = lastStart + 2;
-                const expression = text.substring(expressionStart, endOffset);
-                const offsetInExpression = offset - expressionStart;
+                if (interpolationStartOffset === -1) return null;
 
+                // Walk forwards to find the closing } delimiter
+                let interpolationEndOffset = -1;
+                for (let i = currentTokenIdx + 1; i < tokens.length; i++) {
+                    const token = tokens[i];
+                    if (token.type === 'delimiter.bracket.interpolation.json-interpolation') {
+                        interpolationEndOffset = token.startOffset;
+                        break;
+                    }
+                }
+
+                if (interpolationEndOffset === -1) {
+                    interpolationEndOffset = text.length;
+                }
+
+                const expression = text.substring(interpolationStartOffset, interpolationEndOffset);
                 return {
                     expression,
-                    expressionStart,
-                    offsetInExpression
+                    expressionStart: interpolationStartOffset,
+                    expressionEnd: interpolationEndOffset,
+                    offsetInExpression: offset - interpolationStartOffset
                 };
             }
 

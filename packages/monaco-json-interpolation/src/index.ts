@@ -210,53 +210,143 @@ function getOrCreateVirtualJsModel(): monaco.editor.ITextModel {
 	return virtualJsModel;
 }
 
-// --- Helper to extract interpolation context at a position ---
+// --- Helper to extract interpolation context using tokenization ---
 
 interface InterpolationContext {
 	expression: string;
 	expressionStart: number;
+	expressionEnd: number;
 	offsetInExpression: number;
+}
+
+interface FlatToken {
+	startOffset: number;
+	endOffset: number;
+	type: string;
+}
+
+function flattenTokens(model: monaco.editor.ITextModel): FlatToken[] {
+	const source = model.getValue();
+	const tokenLines = monaco.editor.tokenize(source, LANGUAGE_ID);
+	const tokens: FlatToken[] = [];
+
+	let currentOffset = 0;
+	for (let lineIdx = 0; lineIdx < tokenLines.length; lineIdx++) {
+		const lineTokens = tokenLines[lineIdx];
+		const lineContent = model.getLineContent(lineIdx + 1);
+
+		for (let tokenIdx = 0; tokenIdx < lineTokens.length; tokenIdx++) {
+			const token = lineTokens[tokenIdx];
+			const nextToken = lineTokens[tokenIdx + 1];
+			const startOffset = currentOffset + token.offset;
+			const endOffset = nextToken
+				? currentOffset + nextToken.offset
+				: currentOffset + lineContent.length;
+
+			tokens.push({
+				startOffset,
+				endOffset,
+				type: token.type
+			});
+		}
+		currentOffset += lineContent.length + 1; // +1 for newline
+	}
+
+	return tokens;
 }
 
 function getInterpolationContext(
 	model: monaco.editor.ITextModel,
 	offset: number
 ): InterpolationContext | null {
+	const tokens = flattenTokens(model);
 	const text = model.getValue();
 
-	// Find the last ${ before the cursor
-	const beforeCursor = text.substring(0, offset);
-	const lastStart = beforeCursor.lastIndexOf('${');
-	if (lastStart === -1) {
+	// Find the token at the current offset
+	let currentTokenIdx = -1;
+	for (let i = 0; i < tokens.length; i++) {
+		const token = tokens[i];
+		if (offset >= token.startOffset && offset <= token.endOffset) {
+			currentTokenIdx = i;
+			break;
+		}
+	}
+
+	if (currentTokenIdx === -1) {
 		return null;
 	}
 
-	// Check if there's a closing } between ${ and cursor
-	const betweenStartAndCursor = text.substring(lastStart + 2, offset);
-	if (betweenStartAndCursor.includes('}')) {
+	const currentToken = tokens[currentTokenIdx];
+
+	// Check if we're in an embedded JavaScript region
+	// Embedded JS tokens don't have the .json-interpolation postfix
+	const isInEmbeddedJs = !currentToken.type.endsWith('.json-interpolation') && currentToken.type !== '';
+
+	if (!isInEmbeddedJs) {
+		// Also check if we're right after the ${ delimiter
+		if (currentToken.type === 'delimiter.bracket.interpolation.json-interpolation') {
+			// Check if this is an opening ${ (look at text)
+			const tokenText = text.substring(currentToken.startOffset, currentToken.endOffset);
+			if (tokenText === '${' && offset === currentToken.endOffset) {
+				// Cursor is right after ${, find the closing }
+				for (let i = currentTokenIdx + 1; i < tokens.length; i++) {
+					if (tokens[i].type === 'delimiter.bracket.interpolation.json-interpolation') {
+						const expressionStart = currentToken.endOffset;
+						const expressionEnd = tokens[i].startOffset;
+						return {
+							expression: text.substring(expressionStart, expressionEnd),
+							expressionStart,
+							expressionEnd,
+							offsetInExpression: offset - expressionStart
+						};
+					}
+				}
+			}
+		}
 		return null;
 	}
 
-	// Find the closing } after the cursor (with brace matching)
-	let depth = 1;
-	let endOffset = offset;
-	for (let i = offset; i < text.length; i++) {
-		if (text[i] === '{') {
-			depth++;
-		} else if (text[i] === '}') {
-			depth--;
-			if (depth === 0) {
-				endOffset = i;
+	// Walk backwards to find the ${ delimiter
+	let interpolationStartOffset = -1;
+	for (let i = currentTokenIdx - 1; i >= 0; i--) {
+		const token = tokens[i];
+		if (token.type === 'delimiter.bracket.interpolation.json-interpolation') {
+			const tokenText = text.substring(token.startOffset, token.endOffset);
+			if (tokenText === '${') {
+				interpolationStartOffset = token.endOffset; // After the ${
 				break;
 			}
 		}
 	}
 
-	const expressionStart = lastStart + 2;
-	const expression = text.substring(expressionStart, endOffset);
-	const offsetInExpression = offset - expressionStart;
+	if (interpolationStartOffset === -1) {
+		return null;
+	}
 
-	return { expression, expressionStart, offsetInExpression };
+	// Walk forwards to find the closing } delimiter
+	let interpolationEndOffset = -1;
+	for (let i = currentTokenIdx + 1; i < tokens.length; i++) {
+		const token = tokens[i];
+		if (token.type === 'delimiter.bracket.interpolation.json-interpolation') {
+			interpolationEndOffset = token.startOffset; // Before the }
+			break;
+		}
+	}
+
+	if (interpolationEndOffset === -1) {
+		// No closing brace found yet, use end of text
+		interpolationEndOffset = text.length;
+	}
+
+	const expression = text.substring(interpolationStartOffset, interpolationEndOffset);
+	const offsetInExpression = offset - interpolationStartOffset;
+
+	return {
+		expression,
+		expressionStart: interpolationStartOffset,
+		expressionEnd: interpolationEndOffset,
+		offsetInExpression
+	};
 }
 
 // --- Providers ---

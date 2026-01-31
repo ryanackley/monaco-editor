@@ -463,7 +463,10 @@ Type: \${config.} and press Ctrl+Space
                 automaticLayout: true,
                 fontSize: 14,
                 wordWrap: 'on',
-                wordBasedSuggestions: 'off'  // Only show language service completions
+                wordBasedSuggestions: false,
+                suggest: {
+                    showWords: false
+                }
             });
 
             console.log('Interpolation String editor initialized');

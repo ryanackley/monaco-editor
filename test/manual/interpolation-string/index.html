@@ -226,6 +226,11 @@ declare function getUser(): { id: number; name: string; email: string };
                 }
             ]);
 
+            // Create a shadow JavaScript model for the JS worker
+            // The worker needs a JS model to provide completions/hover
+            const shadowUri = monaco.Uri.parse('file:///shadow.js');
+            let shadowModel = monaco.editor.createModel('', 'javascript', shadowUri);
+
             // Helper to check if inside interpolation
             function isInsideInterpolation(model, offset) {
                 const source = model.getValue();
@@ -247,6 +252,11 @@ declare function getUser(): { id: number; name: string; email: string };
                 return depth > 0;
             }
 
+            // Sync shadow model with main model content
+            function syncShadowModel(model) {
+                shadowModel.setValue(model.getValue());
+            }
+
             // Completion provider for JS inside interpolation
             monaco.languages.registerCompletionItemProvider(LANGUAGE_ID, {
                 triggerCharacters: ['$', '{', '.'],
@@ -256,9 +266,12 @@ declare function getUser(): { id: number; name: string; email: string };
 
                     if (isInsideInterpolation(model, offset)) {
                         try {
+                            // Sync content to shadow JS model
+                            syncShadowModel(model);
+
                             const getWorker = await monaco.languages.typescript.getJavaScriptWorker();
-                            const worker = await getWorker(model.uri);
-                            const info = await worker.getCompletionsAtPosition(model.uri.toString(), offset);
+                            const worker = await getWorker(shadowUri);
+                            const info = await worker.getCompletionsAtPosition(shadowUri.toString(), offset);
 
                             if (!info || !info.entries) return null;
 
@@ -295,9 +308,12 @@ declare function getUser(): { id: number; name: string; email: string };
 
                     if (isInsideInterpolation(model, offset)) {
                         try {
+                            // Sync content to shadow JS model
+                            syncShadowModel(model);
+
                             const getWorker = await monaco.languages.typescript.getJavaScriptWorker();
-                            const worker = await getWorker(model.uri);
-                            const info = await worker.getQuickInfoAtPosition(model.uri.toString(), offset);
+                            const worker = await getWorker(shadowUri);
+                            const info = await worker.getQuickInfoAtPosition(shadowUri.toString(), offset);
 
                             if (!info) return null;
 

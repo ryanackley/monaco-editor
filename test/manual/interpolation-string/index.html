@@ -289,6 +289,9 @@ declare function getUser(): { id: number; name: string; email: string };
 
                     if (isInsideInterpolation(model, offset)) {
                         try {
+                            // Sync content so worker sees the context (e.g., config.)
+                            shadowModel.setValue(model.getValue());
+
                             const getWorker = await monaco.languages.typescript.getJavaScriptWorker();
                             const worker = await getWorker(shadowUri);
                             const info = await worker.getCompletionsAtPosition(shadowUri.toString(), offset);
@@ -390,6 +393,9 @@ declare function getUser(): { id: number; name: string; email: string };
 
                     if (isInsideInterpolation(model, offset)) {
                         try {
+                            // Sync content so worker sees the context
+                            shadowModel.setValue(model.getValue());
+
                             const getWorker = await monaco.languages.typescript.getJavaScriptWorker();
                             const worker = await getWorker(shadowUri);
                             const info = await worker.getQuickInfoAtPosition(shadowUri.toString(), offset);

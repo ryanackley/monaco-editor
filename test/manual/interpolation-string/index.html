@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8" />
+    <title>Interpolation String Language Test</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: #1e1e1e;
+            color: #d4d4d4;
+        }
+        h2 { margin-bottom: 10px; }
+        .info {
+            margin: 10px 0;
+            padding: 10px;
+            background: #2d2d2d;
+            border-radius: 4px;
+        }
+        .info h3 { margin: 0 0 10px 0; }
+        .info ul { margin: 5px 0; padding-left: 20px; }
+        #container {
+            width: 900px;
+            height: 500px;
+            border: 1px solid #444;
+        }
+    </style>
+</head>
+<body>
+    <h2>Interpolation String Language</h2>
+
+    <div class="info">
+        <h3>Features:</h3>
+        <ul>
+            <li>Everything outside <code>${...}</code> is plain text (unhighlighted)</li>
+            <li>Inside <code>${...}</code> gets full JavaScript syntax highlighting</li>
+            <li>Nested braces are handled correctly: <code>${{ key: value }}</code></li>
+            <li>JavaScript strings inside interpolation work: <code>${"hello"}</code></li>
+        </ul>
+    </div>
+
+    <div id="container"></div>
+
+    <!-- Load Monaco from CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.52.0/min/vs/loader.js"></script>
+    <script>
+        require.config({
+            paths: { 'vs': 'https://cdn.jsdelivr.net/npm/monaco-editor@0.52.0/min/vs' }
+        });
+
+        require(['vs/editor/editor.main'], function() {
+            const LANGUAGE_ID = 'interpolation-string';
+
+            // Register the language
+            monaco.languages.register({
+                id: LANGUAGE_ID,
+                extensions: ['.tpl', '.template'],
+                aliases: ['Interpolation String', 'Template String']
+            });
+
+            // Language configuration
+            monaco.languages.setLanguageConfiguration(LANGUAGE_ID, {
+                brackets: [
+                    ['{', '}'],
+                    ['[', ']'],
+                    ['(', ')'],
+                    ['${', '}']
+                ],
+                autoClosingPairs: [
+                    { open: '{', close: '}' },
+                    { open: '[', close: ']' },
+                    { open: '(', close: ')' },
+                    { open: '"', close: '"' },
+                    { open: "'", close: "'" },
+                    { open: '`', close: '`' },
+                    { open: '${', close: '}' }
+                ]
+            });
+
+            // Monarch tokenizer - plain text with JavaScript inside ${}
+            monaco.languages.setMonarchTokensProvider(LANGUAGE_ID, {
+                defaultToken: '',  // Everything unhighlighted by default
+
+                // JavaScript keywords
+                keywords: [
+                    'abstract', 'any', 'as', 'async', 'await', 'boolean', 'break', 'case',
+                    'catch', 'class', 'const', 'constructor', 'continue', 'debugger',
+                    'default', 'delete', 'do', 'else', 'enum', 'export', 'extends', 'false',
+                    'finally', 'for', 'from', 'function', 'get', 'if', 'implements', 'import',
+                    'in', 'instanceof', 'interface', 'let', 'new', 'null', 'number', 'of',
+                    'package', 'private', 'protected', 'public', 'return', 'set', 'static',
+                    'string', 'super', 'switch', 'this', 'throw', 'true', 'try', 'typeof',
+                    'undefined', 'var', 'void', 'while', 'with', 'yield'
+                ],
+
+                operators: [
+                    '<=', '>=', '==', '!=', '===', '!==', '=>', '+', '-', '**', '*', '/',
+                    '%', '++', '--', '<<', '>>', '>>>', '&', '|', '^', '!', '~', '&&', '||',
+                    '??', '?', ':', '=', '+=', '-=', '*=', '**=', '/=', '%=', '<<=', '>>=',
+                    '>>>=', '&=', '|=', '^=', '?.'
+                ],
+
+                symbols: /[=><!~?:&|+\-*\/\^%]+/,
+                escapes: /\\(?:[abfnrtv\\"'`]|x[0-9A-Fa-f]{1,4}|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8})/,
+                digits: /\d+(_+\d+)*/,
+                octaldigits: /[0-7]+(_+[0-7]+)*/,
+                binarydigits: /[0-1]+(_+[0-1]+)*/,
+                hexdigits: /[0-9a-fA-F]+(_+[0-9a-fA-F]+)*/,
+
+                tokenizer: {
+                    // Root state - plain text, looking for ${
+                    root: [
+                        [/\$\{/, { token: 'delimiter.bracket.interpolation', next: '@interpolation' }],
+                        [/./, '']  // Everything else is plain text (unhighlighted)
+                    ],
+
+                    // Inside ${...} - JavaScript with bracket counting
+                    interpolation: [
+                        [/\{/, 'delimiter.bracket', '@bracketCounting'],
+                        [/\}/, 'delimiter.bracket.interpolation', '@pop'],
+                        { include: '@jsCommon' }
+                    ],
+
+                    // Nested brace counting
+                    bracketCounting: [
+                        [/\{/, 'delimiter.bracket', '@bracketCounting'],
+                        [/\}/, 'delimiter.bracket', '@pop'],
+                        { include: '@jsCommon' }
+                    ],
+
+                    // JavaScript tokenization rules
+                    jsCommon: [
+                        [/\s+/, ''],
+                        [/\/\/.*$/, 'comment'],
+                        [/\/\*/, 'comment', '@jsComment'],
+                        [
+                            /[a-zA-Z_$][\w$]*/,
+                            {
+                                cases: {
+                                    '@keywords': 'keyword',
+                                    '@default': 'identifier'
+                                }
+                            }
+                        ],
+                        // Numbers
+                        [/(@digits)[eE]([\-+]?(@digits))?/, 'number.float'],
+                        [/(@digits)\.(@digits)([eE][\-+]?(@digits))?/, 'number.float'],
+                        [/0[xX](@hexdigits)n?/, 'number.hex'],
+                        [/0[oO]?(@octaldigits)n?/, 'number.octal'],
+                        [/0[bB](@binarydigits)n?/, 'number.binary'],
+                        [/(@digits)n?/, 'number'],
+                        // Strings
+                        [/"/, 'string', '@jsStringDouble'],
+                        [/'/, 'string', '@jsStringSingle'],
+                        [/`/, 'string', '@jsStringBacktick'],
+                        // Brackets and operators
+                        [/[()\[\]]/, '@brackets'],
+                        [/[<>](?!@symbols)/, '@brackets'],
+                        [
+                            /@symbols/,
+                            {
+                                cases: {
+                                    '@operators': 'operator',
+                                    '@default': ''
+                                }
+                            }
+                        ],
+                        [/[;,.]/, 'delimiter']
+                    ],
+
+                    jsComment: [
+                        [/[^/*]+/, 'comment'],
+                        [/\*\//, 'comment', '@pop'],
+                        [/[/*]/, 'comment']
+                    ],
+
+                    jsStringDouble: [
+                        [/[^\\"]+/, 'string'],
+                        [/@escapes/, 'string.escape'],
+                        [/\\./, 'string.escape.invalid'],
+                        [/"/, 'string', '@pop']
+                    ],
+
+                    jsStringSingle: [
+                        [/[^\\']+/, 'string'],
+                        [/@escapes/, 'string.escape'],
+                        [/\\./, 'string.escape.invalid'],
+                        [/'/, 'string', '@pop']
+                    ],
+
+                    jsStringBacktick: [
+                        [/\$\{/, { token: 'delimiter.bracket', next: '@nestedInterpolation' }],
+                        [/[^\\`$]+/, 'string'],
+                        [/@escapes/, 'string.escape'],
+                        [/\\./, 'string.escape.invalid'],
+                        [/`/, 'string', '@pop']
+                    ],
+
+                    nestedInterpolation: [
+                        [/\{/, 'delimiter.bracket', '@nestedInterpolation'],
+                        [/\}/, 'delimiter.bracket', '@pop'],
+                        { include: '@jsCommon' }
+                    ]
+                }
+            });
+
+            // Set up JavaScript extra libs for completions
+            monaco.languages.typescript.javascriptDefaults.setExtraLibs([
+                {
+                    content: `
+/** User's name */
+declare const name: string;
+/** Current environment */
+declare const env: string;
+/** Application configuration */
+declare const config: { debug: boolean; port: number; apiUrl: string };
+/** Format a date */
+declare function formatDate(date: Date): string;
+/** Capitalize a string */
+declare function capitalize(str: string): string;
+/** Get current user */
+declare function getUser(): { id: number; name: string; email: string };
+`,
+                    filePath: 'file:///globals.d.ts'
+                }
+            ]);
+
+            // Helper to check if inside interpolation
+            function isInsideInterpolation(model, offset) {
+                const source = model.getValue();
+                let depth = 0;
+
+                for (let i = 0; i < offset && i < source.length; i++) {
+                    const char = source[i];
+
+                    if (char === '$' && source[i + 1] === '{') {
+                        depth++;
+                        i++; // Skip the {
+                    } else if (char === '{' && depth > 0) {
+                        depth++;
+                    } else if (char === '}' && depth > 0) {
+                        depth--;
+                    }
+                }
+
+                return depth > 0;
+            }
+
+            // Completion provider for JS inside interpolation
+            monaco.languages.registerCompletionItemProvider(LANGUAGE_ID, {
+                triggerCharacters: ['$', '{', '.'],
+
+                async provideCompletionItems(model, position) {
+                    const offset = model.getOffsetAt(position);
+
+                    if (isInsideInterpolation(model, offset)) {
+                        try {
+                            const getWorker = await monaco.languages.typescript.getJavaScriptWorker();
+                            const worker = await getWorker(model.uri);
+                            const info = await worker.getCompletionsAtPosition(model.uri.toString(), offset);
+
+                            if (!info || !info.entries) return null;
+
+                            const wordInfo = model.getWordUntilPosition(position);
+                            const range = {
+                                startLineNumber: position.lineNumber,
+                                startColumn: wordInfo.startColumn,
+                                endLineNumber: position.lineNumber,
+                                endColumn: wordInfo.endColumn
+                            };
+
+                            const suggestions = info.entries.map(entry => ({
+                                label: entry.name,
+                                kind: monaco.languages.CompletionItemKind.Variable,
+                                detail: entry.kindModifiers,
+                                sortText: entry.sortText,
+                                insertText: entry.insertText || entry.name,
+                                range: range
+                            }));
+
+                            return { suggestions };
+                        } catch (e) {
+                            console.error('JS completion error:', e);
+                        }
+                    }
+                    return null;
+                }
+            });
+
+            // Hover provider for JS inside interpolation
+            monaco.languages.registerHoverProvider(LANGUAGE_ID, {
+                async provideHover(model, position) {
+                    const offset = model.getOffsetAt(position);
+
+                    if (isInsideInterpolation(model, offset)) {
+                        try {
+                            const getWorker = await monaco.languages.typescript.getJavaScriptWorker();
+                            const worker = await getWorker(model.uri);
+                            const info = await worker.getQuickInfoAtPosition(model.uri.toString(), offset);
+
+                            if (!info) return null;
+
+                            const contents = [];
+                            if (info.displayParts) {
+                                const displayText = info.displayParts.map(p => p.text).join('');
+                                contents.push({ value: '```typescript\n' + displayText + '\n```' });
+                            }
+                            if (info.documentation && info.documentation.length > 0) {
+                                const docText = info.documentation.map(p => p.text).join('');
+                                contents.push({ value: docText });
+                            }
+
+                            if (contents.length === 0) return null;
+
+                            const wordInfo = model.getWordAtPosition(position);
+                            const range = wordInfo ? {
+                                startLineNumber: position.lineNumber,
+                                startColumn: wordInfo.startColumn,
+                                endLineNumber: position.lineNumber,
+                                endColumn: wordInfo.endColumn
+                            } : undefined;
+
+                            return { contents, range };
+                        } catch (e) {
+                            console.error('JS hover error:', e);
+                        }
+                    }
+                    return null;
+                }
+            });
+
+            // Sample content
+            const sampleContent = `Hello \${name}!
+
+This is plain text - no highlighting here.
+But inside interpolation blocks, you get JavaScript:
+
+Simple variable: \${name}
+Property access: \${config.debug}
+Method call: \${capitalize(name)}
+Ternary: \${config.debug ? 'DEBUG MODE' : 'production'}
+
+Nested braces work correctly:
+Object literal: \${{ key: 'value', nested: { deep: true } }}
+Arrow function: \${(() => { return { x: 1, y: 2 }; })()}
+Array methods: \${[1, 2, 3].map(x => x * 2).join(', ')}
+
+Complex expression:
+\${getUser().name.toUpperCase()}
+
+Try typing inside \${} to see autocompletion!
+Type: \${config.} and press Ctrl+Space
+`;
+
+            // Create the editor
+            const editor = monaco.editor.create(document.getElementById('container'), {
+                value: sampleContent,
+                language: LANGUAGE_ID,
+                theme: 'vs-dark',
+                minimap: { enabled: false },
+                automaticLayout: true,
+                fontSize: 14,
+                wordWrap: 'on'
+            });
+
+            console.log('Interpolation String editor initialized');
+        });
+    </script>
+</body>
+</html>

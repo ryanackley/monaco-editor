@@ -276,6 +276,7 @@ declare function getUser(): { id: number; name: string; email: string };
                     'type parameter': monaco.languages.CompletionItemKind.TypeParameter,
                     'alias': monaco.languages.CompletionItemKind.Variable,
                     'string': monaco.languages.CompletionItemKind.Value,
+                    'warning' : monaco.languages.CompletionItemKind.Text
                 };
                 return map[kind] || monaco.languages.CompletionItemKind.Property;
             }
@@ -463,7 +464,7 @@ Type: \${config.} and press Ctrl+Space
                 automaticLayout: true,
                 fontSize: 14,
                 wordWrap: 'on',
-                wordBasedSuggestions: false,
+                wordBasedSuggestions: 'off',
                 suggest: {
                     showWords: false
                 }
